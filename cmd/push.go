@@ -56,7 +56,7 @@ func (cmd *PushCmd) Run(cobraCmd *cobra.Command, args []string) error {
 	}()
 
 	// get OAuth2 Configuration with our App credentials
-	oauth2Config := oauth2.Config{
+	oauth2Config := &oauth2.Config{
 		ClientID:     cfg.APIAppCredentials.ClientID,
 		ClientSecret: cfg.APIAppCredentials.ClientSecret,
 		Endpoint:     photos.Endpoint,

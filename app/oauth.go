@@ -2,13 +2,17 @@ package app
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"os/user"
+	"path/filepath"
 
-	"github.com/int128/oauth2cli"
-	"github.com/pkg/browser"
 	"golang.org/x/oauth2"
-	"golang.org/x/sync/errgroup"
 )
 
 const successPage = `
@@ -17,85 +21,87 @@ const successPage = `
 		<script>window.onload=function(){setTimeout(this.close, 4000)}</script>
 		`
 
-func newHTTPClient() *http.Client {
-	return http.DefaultClient
-}
-
 // NewOAuth2Client returns a http client for the supplied Google account.
 // It will try to get the credentials from the Token Manager, if they are not valid will try to refresh the token or
 // ask for authenticate again.
-func (app *App) NewOAuth2Client(ctx context.Context, oauth2Config oauth2.Config, account string) (*http.Client, error) {
-	token, err := app.TokenManager.RetrieveToken(account)
+func (app *App) NewOAuth2Client(ctx context.Context, config *oauth2.Config, account string) (*http.Client, error) {
+	config.RedirectURL = "urn:ietf:wg:oauth:2.0:oob"
+
+	cacheFile, err := tokenCacheFile(account)
 	if err != nil {
-		app.Logger.Debugf("Token has not been retrieved from token store: %s", err)
+		return nil, fmt.Errorf("Unable to get path to cached credential file. %v", err)
 	}
-
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, newHTTPClient())
-	switch {
-	case token == nil:
-		token, err = app.obtainOAuthTokenFromAuthServer(ctx, oauth2Config)
-		if err != nil {
-			return nil, fmt.Errorf("could not get a token: %s", err)
-		}
-
-	case !token.Valid():
-		app.Logger.Info("Token has been expired, refreshing")
-		token, err = oauth2Config.TokenSource(ctx, token).Token()
-		if err != nil {
-			return nil, fmt.Errorf("could not refresh the token: %s", err)
+	tok, err := tokenFromFile(cacheFile)
+	if err != nil {
+		authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+		fmt.Println("Trying to get token from prompt")
+		tok, err = getTokenFromPrompt(config, authURL)
+		if err == nil {
+			saveToken(cacheFile, tok)
 		}
 	}
-
-	// debug
-	if token != nil {
-		app.Logger.Debugf("Token expiration: %s", token.Expiry.String())
-	}
-
-	// and store the token into the keyring
-	err = app.TokenManager.StoreToken(account, token)
-	if err != nil {
-		return nil, fmt.Errorf("failed storing token: %s", err)
-	}
-
-	client := oauth2Config.Client(ctx, token)
-	return client, nil
+	return config.Client(ctx, tok), nil
 }
 
-func (app *App) obtainOAuthTokenFromAuthServer(ctx context.Context, oauth2Config oauth2.Config) (*oauth2.Token, error) {
-	var token *oauth2.Token
-	var err error
-
-	ready := make(chan string, 1)
-	var eg errgroup.Group
-	eg.Go(func() error {
-		select {
-		case url, ok := <-ready:
-			if !ok {
-				return nil
-			}
-			// Open a browser to complete OAuth process.
-			app.Logger.Info("Opening browser to complete authorization.")
-			err = browser.OpenURL(url)
-			if err != nil {
-				app.Logger.Warnf("Browser was not detected. Complete the authorization browsing to: %s", url)
-			}
-			return nil
-		case err := <-ctx.Done():
-			return fmt.Errorf("context done while waiting for authorization: %s", err)
-		}
-	})
-	eg.Go(func() error {
-		defer close(ready)
-		token, err = oauth2cli.GetToken(ctx, oauth2cli.Config{
-			OAuth2Config:           oauth2Config,
-			LocalServerReadyChan:   ready,
-			LocalServerSuccessHTML: successPage,
-		})
-		return err
-	})
-	if err := eg.Wait(); err != nil {
-		app.Logger.Errorf("error while authorization: %s", err)
+// Exchange the authorization code for an access token
+func exchangeToken(config *oauth2.Config, code string) (*oauth2.Token, error) {
+	tok, err := config.Exchange(oauth2.NoContext, code)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to retrieve token %v", err)
 	}
+	return tok, nil
+}
 
-	return token, err
+// getTokenFromPrompt uses Config to request a Token and prompts the user
+// to enter the token on the command line. It returns the retrieved Token.
+func getTokenFromPrompt(config *oauth2.Config, authURL string) (*oauth2.Token, error) {
+	var code string
+	fmt.Printf("Go to the following link in your browser. After completing "+
+		"the authorization flow, enter the authorization code on the command "+
+		"line: \n%v\n", authURL)
+
+	if _, err := fmt.Scan(&code); err != nil {
+		log.Fatalf("Unable to read authorization code %v", err)
+	}
+	fmt.Println(authURL)
+	return exchangeToken(config, code)
+}
+
+// tokenCacheFile generates credential file path/filename.
+// It returns the generated credential path/filename.
+func tokenCacheFile(account string) (string, error) {
+	usr, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	tokenCacheDir := filepath.Join(usr.HomeDir, ".gphotos-credentials")
+	os.MkdirAll(tokenCacheDir, 0700)
+	return filepath.Join(tokenCacheDir,
+		url.QueryEscape(fmt.Sprintf("creds-%s.json", md5.Sum([]byte(account))))), err
+}
+
+// tokenFromFile retrieves a Token from a given file path.
+// It returns the retrieved Token and any read error encountered.
+func tokenFromFile(file string) (*oauth2.Token, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	t := &oauth2.Token{}
+	err = json.NewDecoder(f).Decode(t)
+	defer f.Close()
+	return t, err
+}
+
+// saveToken uses a file path to create a file and store the
+// token in it.
+func saveToken(file string, token *oauth2.Token) {
+	fmt.Println("trying to save token")
+	fmt.Printf("Saving credential file to: %s\n", file)
+	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		log.Fatalf("Unable to cache oauth token: %v", err)
+	}
+	defer f.Close()
+	json.NewEncoder(f).Encode(token)
 }
